@@ -383,10 +383,6 @@ export default function MemoryAssistant() {
     });
     setImportedCount(c => c + imported.length);
   }, []);
-      return next;
-    });
-    setImportedCount(c => c + imported.length);
-  }, []);
 
   // ── TTS ──
   const stopSpeaking = useCallback(() => {
