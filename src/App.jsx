@@ -232,6 +232,7 @@ export default function MemoryAssistant() {
   const textareaRef    = useRef(null);
   const audioRef       = useRef(null);
   const recognitionRef = useRef(null);
+  const startVoiceListeningRef = useRef(null); // ref so speak() can call it without stale closure
 
   useEffect(() => {
     Promise.all([loadSessions(), loadApiKey()]).then(([loaded, key]) => {
@@ -272,16 +273,16 @@ export default function MemoryAssistant() {
 
   // ── TTS via OpenAI Nova ──
   const stopSpeaking = useCallback(() => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current.onended = null; audioRef.current.onerror = null; audioRef.current = null; }
     setSpeakingId(null);
-    if (voiceStatus === "speaking") setVoiceStatus("idle");
-  }, [voiceStatus]);
+  }, []);
 
-  const speak = useCallback(async (text, msgId, onDone) => {
+  const speak = useCallback(async (text, msgId) => {
     if (!apiKey) return;
     stopSpeaking();
     const clean = text.replace(/[*_`#>]/g,"").replace(/\n+/g," ").slice(0,4000);
     setSpeakingId(msgId);
+    setVoiceStatus("speaking");
     try {
       const res = await fetch("https://api.openai.com/v1/audio/speech", {
         method:"POST",
@@ -292,14 +293,33 @@ export default function MemoryAssistant() {
       const url = URL.createObjectURL(await res.blob());
       const audio = new Audio(url);
       audioRef.current = audio;
-      audio.onended  = () => { setSpeakingId(null); URL.revokeObjectURL(url); onDone?.(); };
-      audio.onerror  = () => { setSpeakingId(null); onDone?.(); };
-      audio.play();
-    } catch { setSpeakingId(null); onDone?.(); }
+      audio.onended = () => {
+        setSpeakingId(null);
+        URL.revokeObjectURL(url);
+        audioRef.current = null;
+        // After speaking, auto-listen again if still in voice mode
+        if (voiceModeRef.current) {
+          setTimeout(() => startVoiceListeningRef.current?.(), 600);
+        } else {
+          setVoiceStatus("idle");
+        }
+      };
+      audio.onerror = () => {
+        setSpeakingId(null);
+        audioRef.current = null;
+        if (voiceModeRef.current) setTimeout(() => startVoiceListeningRef.current?.(), 600);
+        else setVoiceStatus("idle");
+      };
+      await audio.play();
+    } catch {
+      setSpeakingId(null);
+      if (voiceModeRef.current) setTimeout(() => startVoiceListeningRef.current?.(), 600);
+      else setVoiceStatus("idle");
+    }
   }, [apiKey, stopSpeaking]);
 
   // ── Core send logic (shared by text + voice) ──
-  const sendText = useCallback(async (text, onReplyDone) => {
+  const sendText = useCallback(async (text) => {
     if (!text.trim() || !currentSession || !apiKey) return;
 
     const userMsg  = { role:"user", content: text.trim() };
@@ -341,11 +361,15 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
       setSessions(prev => prev.map(s => s.id===currentId ? withReply : s));
       upsertSession(withReply);
 
-      if (voiceEnabled || onReplyDone) speak(reply, msgId, onReplyDone);
+      // Always speak in voice mode; respect voiceEnabled toggle in text mode
+      if (voiceModeRef.current || voiceEnabled) {
+        speak(reply, msgId);
+      }
     } catch (err) {
       const errSession = { ...updatedSession, messages:[...updated,{role:"assistant",content:`Error: ${err.message}`,id:crypto.randomUUID()}] };
       setSessions(prev => prev.map(s => s.id===currentId ? errSession : s));
-      onReplyDone?.();
+      // On error in voice mode, go back to listening
+      if (voiceModeRef.current) setTimeout(() => startVoiceListeningRef.current?.(), 600);
     } finally {
       setLoading(false);
     }
@@ -364,9 +388,10 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
 
   // ── Voice conversation mode ──
   const startVoiceListening = useCallback(() => {
+    if (!voiceModeRef.current) return;
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { alert("Voice not supported. Use Chrome or Safari."); return; }
-    if (recognitionRef.current) recognitionRef.current.abort();
+    if (recognitionRef.current) { recognitionRef.current.abort(); recognitionRef.current = null; }
 
     const rec = new SR();
     rec.lang = "en-US";
@@ -383,40 +408,38 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
       }
       setVoiceTranscript(finalText||interim);
     };
-    rec.onend = async () => {
+    rec.onend = () => {
       recognitionRef.current = null;
       const text = finalText.trim();
       if (!text) {
-        // Nothing heard — if still in voice mode, listen again
-        if (voiceModeRef.current) setTimeout(() => startVoiceListening(), 400);
+        // Nothing heard — listen again
+        if (voiceModeRef.current) setTimeout(() => startVoiceListeningRef.current?.(), 400);
         else setVoiceStatus("idle");
         return;
       }
       setVoiceStatus("thinking");
       setVoiceTranscript(text);
-      await sendText(text, () => {
-        // Nova finished speaking — auto-listen again if still in voice mode
-        setVoiceStatus("idle");
-        if (voiceModeRef.current) setTimeout(() => startVoiceListening(), 600);
-      });
+      // sendText will call speak(), which will auto-loop back to listen when done
+      sendText(text);
     };
     rec.onerror = e => {
       recognitionRef.current = null;
       if (e.error !== "aborted" && voiceModeRef.current) {
-        setVoiceStatus("idle");
-        setTimeout(() => startVoiceListening(), 800);
-      } else {
+        setTimeout(() => startVoiceListeningRef.current?.(), 800);
+      } else if (!voiceModeRef.current) {
         setVoiceStatus("idle");
       }
     };
 
     recognitionRef.current = rec;
-    try { rec.start(); } catch { setVoiceStatus("idle"); }
+    try { rec.start(); } catch { if (voiceModeRef.current) setTimeout(()=>startVoiceListeningRef.current?.(), 800); }
   }, [sendText]);
+
+  // Keep ref in sync with latest function
+  useEffect(() => { startVoiceListeningRef.current = startVoiceListening; }, [startVoiceListening]);
 
   const toggleVoiceMode = useCallback(() => {
     if (voiceModeRef.current) {
-      // Exit voice mode
       voiceModeRef.current = false;
       recognitionRef.current?.abort();
       recognitionRef.current = null;
@@ -430,11 +453,6 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
       startVoiceListening();
     }
   }, [voiceMode, stopSpeaking, startVoiceListening]);
-
-  // When voice status changes to speaking, update overlay
-  useEffect(() => {
-    if (voiceMode && speakingId) setVoiceStatus("speaking");
-  }, [speakingId, voiceMode]);
 
   // Session management
   const createSession = useCallback(() => {
