@@ -226,6 +226,7 @@ export default function MemoryAssistant() {
   const [voiceMode, setVoiceMode]         = useState(false);
   const [voiceStatus, setVoiceStatus]     = useState("idle"); // idle|listening|thinking|speaking
   const [voiceTranscript, setVoiceTranscript] = useState("");
+  const voiceModeRef = useRef(false); // ref so callbacks always see latest value
 
   const messagesEndRef = useRef(null);
   const textareaRef    = useRef(null);
@@ -285,7 +286,7 @@ export default function MemoryAssistant() {
       const res = await fetch("https://api.openai.com/v1/audio/speech", {
         method:"POST",
         headers:{"Authorization":`Bearer ${apiKey}`,"Content-Type":"application/json"},
-        body: JSON.stringify({ model:"tts-1", voice:"nova", input: clean, speed:1.0 }),
+        body: JSON.stringify({ model:"tts-1", voice:"nova", input: clean, speed:1.2 }),
       });
       if (!res.ok) throw new Error();
       const url = URL.createObjectURL(await res.blob());
@@ -385,29 +386,38 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
     rec.onend = async () => {
       recognitionRef.current = null;
       const text = finalText.trim();
-      if (!text) { setVoiceStatus("idle"); return; }
+      if (!text) {
+        // Nothing heard — if still in voice mode, listen again
+        if (voiceModeRef.current) setTimeout(() => startVoiceListening(), 400);
+        else setVoiceStatus("idle");
+        return;
+      }
       setVoiceStatus("thinking");
       setVoiceTranscript(text);
       await sendText(text, () => {
-        // After Nova finishes speaking, listen again automatically
+        // Nova finished speaking — auto-listen again if still in voice mode
         setVoiceStatus("idle");
-        setTimeout(() => {
-          if (voiceMode) startVoiceListening();
-        }, 600);
+        if (voiceModeRef.current) setTimeout(() => startVoiceListening(), 600);
       });
     };
     rec.onerror = e => {
       recognitionRef.current = null;
-      if (e.error !== "aborted") setVoiceStatus("idle");
+      if (e.error !== "aborted" && voiceModeRef.current) {
+        setVoiceStatus("idle");
+        setTimeout(() => startVoiceListening(), 800);
+      } else {
+        setVoiceStatus("idle");
+      }
     };
 
     recognitionRef.current = rec;
     try { rec.start(); } catch { setVoiceStatus("idle"); }
-  }, [sendText, voiceMode]);
+  }, [sendText]);
 
   const toggleVoiceMode = useCallback(() => {
-    if (voiceMode) {
+    if (voiceModeRef.current) {
       // Exit voice mode
+      voiceModeRef.current = false;
       recognitionRef.current?.abort();
       recognitionRef.current = null;
       stopSpeaking();
@@ -415,6 +425,7 @@ Today is ${new Date().toLocaleDateString("en-US",{weekday:"long",year:"numeric",
       setVoiceStatus("idle");
       setVoiceTranscript("");
     } else {
+      voiceModeRef.current = true;
       setVoiceMode(true);
       startVoiceListening();
     }
